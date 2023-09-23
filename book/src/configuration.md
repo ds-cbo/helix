@@ -59,12 +59,26 @@ Its settings will be merged with the configuration directory `config.toml` and t
 | `true-color` | Set to `true` to override automatic detection of terminal truecolor support in the event of a false negative | `false` |
 | `undercurl` | Set to `true` to override automatic detection of terminal undercurl support in the event of a false negative | `false` |
 | `rulers` | List of column positions at which to display the rulers. Can be overridden by language specific `rulers` in `languages.toml` file | `[]` |
-| `bufferline` | Renders a line at the top of the editor displaying open buffers. Can be `always`, `never` or `multiple` (only shown if more than one buffer is in use) | `never` |
 | `color-modes` | Whether to color the mode indicator with different colors depending on the mode itself | `false` |
 | `text-width` | Maximum line length. Used for the `:reflow` command and soft-wrapping if `soft-wrap.wrap-at-text-width` is set | `80` |
 | `workspace-lsp-roots` | Directories relative to the workspace root that are treated as LSP roots. Should only be set in `.helix/config.toml` | `[]` |
 | `default-line-ending` | The line ending to use for new documents. Can be `native`, `lf`, `crlf`, `ff`, `cr` or `nel`. `native` uses the platform's native line ending (`crlf` on Windows, otherwise `lf`). | `native` |
 | `insert-final-newline` | Whether to automatically insert a trailing line-ending on write if missing | `true` |
+
+### `[editor.bufferline]` Section
+
+Allows configuring the bufferline at the top of the editor.
+
+```toml
+[editor.bufferline]
+show = "always"
+style = "scroll"
+```
+
+| Key     | Description | Default |
+| ---     | ---         | ---     |
+| `show`  | Can be `always`, `never` or `multiple` (only shown if more than one buffer is in use) | `never` |
+| `style` | Can be `overflow`, `wrap` or `scroll`. | `overflow` |
 
 ### `[editor.statusline]` Section
 
