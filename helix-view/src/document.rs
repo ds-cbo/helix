@@ -684,7 +684,7 @@ impl Document {
     pub fn open(
         path: &Path,
         encoding: Option<&'static Encoding>,
-        config_loader: Option<Arc<syntax::Loader>>,
+        config_loader: Option<Arc<ArcSwap<syntax::Loader>>>,
         config: Arc<dyn DynAccess<Config>>,
         force_readonly: bool,
     ) -> Result<Self, Error> {
@@ -730,7 +730,12 @@ impl Document {
         if let Some((fmt_cmd, fmt_args)) = self
             .language_config()
             .and_then(|c| c.formatter.as_ref())
-            .and_then(|formatter| Some((which::which(&formatter.command).ok()?, &formatter.args)))
+            .and_then(|formatter| {
+                Some((
+                    helix_stdx::env::which(&formatter.command).ok()?,
+                    &formatter.args,
+                ))
+            })
         {
             use std::process::Stdio;
             let text = self.text().clone();
@@ -925,10 +930,11 @@ impl Document {
     }
 
     /// Detect the programming language based on the file type.
-    pub fn detect_language(&mut self, config_loader: Arc<syntax::Loader>) {
+    pub fn detect_language(&mut self, config_loader: Arc<ArcSwap<syntax::Loader>>) {
+        let loader = config_loader.load();
         self.set_language(
-            self.detect_language_config(&config_loader),
-            Some(config_loader),
+            self.detect_language_config(&loader),
+            Some(Arc::clone(&config_loader)),
         );
     }
 
@@ -1044,6 +1050,9 @@ impl Document {
         self.encoding
     }
 
+    /// sets the document path without sending events to various
+    /// observers (like LSP), in most cases `Editor::set_doc_path`
+    /// should be used instead
     pub fn set_path(&mut self, path: Option<&Path>) {
         let path = path.map(helix_stdx::path::canonicalize);
 
@@ -1059,10 +1068,12 @@ impl Document {
     pub fn set_language(
         &mut self,
         language_config: Option<Arc<helix_core::syntax::LanguageConfiguration>>,
-        loader: Option<Arc<helix_core::syntax::Loader>>,
+        loader: Option<Arc<ArcSwap<helix_core::syntax::Loader>>>,
     ) {
         if let (Some(language_config), Some(loader)) = (language_config, loader) {
-            if let Some(highlight_config) = language_config.highlight_config(&loader.scopes()) {
+            if let Some(highlight_config) =
+                language_config.highlight_config(&(*loader).load().scopes())
+            {
                 self.syntax = Syntax::new(self.text.slice(..), highlight_config, loader);
             }
 
@@ -1078,9 +1089,10 @@ impl Document {
     pub fn set_language_by_language_id(
         &mut self,
         language_id: &str,
-        config_loader: Arc<syntax::Loader>,
+        config_loader: Arc<ArcSwap<syntax::Loader>>,
     ) -> anyhow::Result<()> {
-        let language_config = config_loader
+        let language_config = (*config_loader)
+            .load()
             .language_config_for_language_id(language_id)
             .ok_or_else(|| anyhow!("invalid language id: {}", language_id))?;
         self.set_language(Some(language_config), Some(config_loader));

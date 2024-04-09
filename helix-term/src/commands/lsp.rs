@@ -38,7 +38,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     fmt::Write,
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 /// Gets the first language server that is attached to a document which supports a specific feature.
@@ -134,7 +134,7 @@ struct DiagnosticStyles {
 }
 
 struct PickerDiagnostic {
-    url: lsp::Url,
+    path: PathBuf,
     diag: lsp::Diagnostic,
     offset_encoding: OffsetEncoding,
 }
@@ -167,8 +167,7 @@ impl ui::menu::Item for PickerDiagnostic {
         let path = match format {
             DiagnosticsFormat::HideSourcePath => String::new(),
             DiagnosticsFormat::ShowSourcePath => {
-                let file_path = self.url.to_file_path().unwrap();
-                let path = path::get_truncated_path(file_path);
+                let path = path::get_truncated_path(&self.path);
                 format!("{}: ", path.to_string_lossy())
             }
         };
@@ -208,24 +207,33 @@ fn jump_to_location(
             return;
         }
     };
+    jump_to_position(editor, &path, location.range, offset_encoding, action);
+}
 
-    let doc = match editor.open(&path, action) {
+fn jump_to_position(
+    editor: &mut Editor,
+    path: &Path,
+    range: lsp::Range,
+    offset_encoding: OffsetEncoding,
+    action: Action,
+) {
+    let doc = match editor.open(path, action) {
         Ok(id) => doc_mut!(editor, &id),
         Err(err) => {
-            let err = format!("failed to open path: {:?}: {:?}", location.uri, err);
+            let err = format!("failed to open path: {:?}: {:?}", path, err);
             editor.set_error(err);
             return;
         }
     };
     let view = view_mut!(editor);
     // TODO: convert inside server
-    let new_range =
-        if let Some(new_range) = lsp_range_to_range(doc.text(), location.range, offset_encoding) {
-            new_range
-        } else {
-            log::warn!("lsp position out of bounds - {:?}", location.range);
-            return;
-        };
+    let new_range = if let Some(new_range) = lsp_range_to_range(doc.text(), range, offset_encoding)
+    {
+        new_range
+    } else {
+        log::warn!("lsp position out of bounds - {:?}", range);
+        return;
+    };
     // we flip the range so that the cursor sits on the start of the symbol
     // (for example start of the function).
     doc.set_selection(view.id, Selection::single(new_range.head, new_range.anchor));
@@ -258,21 +266,20 @@ enum DiagnosticsFormat {
 
 fn diag_picker(
     cx: &Context,
-    diagnostics: BTreeMap<lsp::Url, Vec<(lsp::Diagnostic, usize)>>,
-    _current_path: Option<lsp::Url>,
+    diagnostics: BTreeMap<PathBuf, Vec<(lsp::Diagnostic, usize)>>,
     format: DiagnosticsFormat,
 ) -> Picker<PickerDiagnostic> {
     // TODO: drop current_path comparison and instead use workspace: bool flag?
 
     // flatten the map to a vec of (url, diag) pairs
     let mut flat_diag = Vec::new();
-    for (url, diags) in diagnostics {
+    for (path, diags) in diagnostics {
         flat_diag.reserve(diags.len());
 
         for (diag, ls) in diags {
             if let Some(ls) = cx.editor.language_server_by_id(ls) {
                 flat_diag.push(PickerDiagnostic {
-                    url: url.clone(),
+                    path: path.clone(),
                     diag,
                     offset_encoding: ls.offset_encoding(),
                 });
@@ -292,22 +299,17 @@ fn diag_picker(
         (styles, format),
         move |cx,
               PickerDiagnostic {
-                  url,
+                  path,
                   diag,
                   offset_encoding,
               },
               action| {
-            jump_to_location(
-                cx.editor,
-                &lsp::Location::new(url.clone(), diag.range),
-                *offset_encoding,
-                action,
-            )
+            jump_to_position(cx.editor, path, diag.range, *offset_encoding, action)
         },
     )
-    .with_preview(move |_editor, PickerDiagnostic { url, diag, .. }| {
-        let location = lsp::Location::new(url.clone(), diag.range);
-        Some(location_to_file_location(&location))
+    .with_preview(move |_editor, PickerDiagnostic { path, diag, .. }| {
+        let line = Some((diag.range.start.line as usize, diag.range.end.line as usize));
+        Some((path.clone().into(), line))
     })
     .truncate_start(false)
 }
@@ -470,17 +472,16 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
 
 pub fn diagnostics_picker(cx: &mut Context) {
     let doc = doc!(cx.editor);
-    if let Some(current_url) = doc.url() {
+    if let Some(current_path) = doc.path() {
         let diagnostics = cx
             .editor
             .diagnostics
-            .get(&current_url)
+            .get(current_path)
             .cloned()
             .unwrap_or_default();
         let picker = diag_picker(
             cx,
-            [(current_url.clone(), diagnostics)].into(),
-            Some(current_url),
+            [(current_path.clone(), diagnostics)].into(),
             DiagnosticsFormat::HideSourcePath,
         );
         cx.push_layer(Box::new(overlaid(picker)));
@@ -488,16 +489,9 @@ pub fn diagnostics_picker(cx: &mut Context) {
 }
 
 pub fn workspace_diagnostics_picker(cx: &mut Context) {
-    let doc = doc!(cx.editor);
-    let current_url = doc.url();
     // TODO not yet filtered by LanguageServerFeature, need to do something similar as Document::shown_diagnostics here for all open documents
     let diagnostics = cx.editor.diagnostics.clone();
-    let picker = diag_picker(
-        cx,
-        diagnostics,
-        current_url,
-        DiagnosticsFormat::ShowSourcePath,
-    );
+    let picker = diag_picker(cx, diagnostics, DiagnosticsFormat::ShowSourcePath);
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
@@ -726,8 +720,7 @@ pub fn code_action(cx: &mut Context) {
                             resolved_code_action.as_ref().unwrap_or(code_action);
 
                         if let Some(ref workspace_edit) = resolved_code_action.edit {
-                            log::debug!("edit: {:?}", workspace_edit);
-                            let _ = apply_workspace_edit(editor, offset_encoding, workspace_edit);
+                            let _ = editor.apply_workspace_edit(offset_encoding, workspace_edit);
                         }
 
                         // if code action provides both edit and command first the edit
@@ -787,63 +780,6 @@ pub fn execute_lsp_command(editor: &mut Editor, language_server_id: usize, cmd: 
     });
 }
 
-pub fn apply_document_resource_op(op: &lsp::ResourceOp) -> std::io::Result<()> {
-    use lsp::ResourceOp;
-    use std::fs;
-    match op {
-        ResourceOp::Create(op) => {
-            let path = op.uri.to_file_path().unwrap();
-            let ignore_if_exists = op.options.as_ref().map_or(false, |options| {
-                !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
-            });
-            if ignore_if_exists && path.exists() {
-                Ok(())
-            } else {
-                // Create directory if it does not exist
-                if let Some(dir) = path.parent() {
-                    if !dir.is_dir() {
-                        fs::create_dir_all(dir)?;
-                    }
-                }
-
-                fs::write(&path, [])
-            }
-        }
-        ResourceOp::Delete(op) => {
-            let path = op.uri.to_file_path().unwrap();
-            if path.is_dir() {
-                let recursive = op
-                    .options
-                    .as_ref()
-                    .and_then(|options| options.recursive)
-                    .unwrap_or(false);
-
-                if recursive {
-                    fs::remove_dir_all(&path)
-                } else {
-                    fs::remove_dir(&path)
-                }
-            } else if path.is_file() {
-                fs::remove_file(&path)
-            } else {
-                Ok(())
-            }
-        }
-        ResourceOp::Rename(op) => {
-            let from = op.old_uri.to_file_path().unwrap();
-            let to = op.new_uri.to_file_path().unwrap();
-            let ignore_if_exists = op.options.as_ref().map_or(false, |options| {
-                !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
-            });
-            if ignore_if_exists && to.exists() {
-                Ok(())
-            } else {
-                fs::rename(from, &to)
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct ApplyEditError {
     pub kind: ApplyEditErrorKind,
@@ -871,142 +807,7 @@ impl ToString for ApplyEditErrorKind {
     }
 }
 
-///TODO make this transactional (and set failureMode to transactional)
-pub fn apply_workspace_edit(
-    editor: &mut Editor,
-    offset_encoding: OffsetEncoding,
-    workspace_edit: &lsp::WorkspaceEdit,
-) -> Result<(), ApplyEditError> {
-    let mut apply_edits = |uri: &helix_lsp::Url,
-                           version: Option<i32>,
-                           text_edits: Vec<lsp::TextEdit>|
-     -> Result<(), ApplyEditErrorKind> {
-        let path = match uri.to_file_path() {
-            Ok(path) => path,
-            Err(_) => {
-                let err = format!("unable to convert URI to filepath: {}", uri);
-                log::error!("{}", err);
-                editor.set_error(err);
-                return Err(ApplyEditErrorKind::UnknownURISchema);
-            }
-        };
-
-        let doc_id = match editor.open(&path, Action::Load) {
-            Ok(doc_id) => doc_id,
-            Err(err) => {
-                let err = format!("failed to open document: {}: {}", uri, err);
-                log::error!("{}", err);
-                editor.set_error(err);
-                return Err(ApplyEditErrorKind::FileNotFound);
-            }
-        };
-
-        let doc = doc!(editor, &doc_id);
-        if let Some(version) = version {
-            if version != doc.version() {
-                let err = format!("outdated workspace edit for {path:?}");
-                log::error!("{err}, expected {} but got {version}", doc.version());
-                editor.set_error(err);
-                return Err(ApplyEditErrorKind::DocumentChanged);
-            }
-        }
-
-        // Need to determine a view for apply/append_changes_to_history
-        let view_id = editor.get_synced_view_id(doc_id);
-        let doc = doc_mut!(editor, &doc_id);
-
-        let transaction = helix_lsp::util::generate_transaction_from_edits(
-            doc.text(),
-            text_edits,
-            offset_encoding,
-        );
-        let view = view_mut!(editor, view_id);
-        doc.apply(&transaction, view.id);
-        doc.append_changes_to_history(view);
-        Ok(())
-    };
-
-    if let Some(ref document_changes) = workspace_edit.document_changes {
-        match document_changes {
-            lsp::DocumentChanges::Edits(document_edits) => {
-                for (i, document_edit) in document_edits.iter().enumerate() {
-                    let edits = document_edit
-                        .edits
-                        .iter()
-                        .map(|edit| match edit {
-                            lsp::OneOf::Left(text_edit) => text_edit,
-                            lsp::OneOf::Right(annotated_text_edit) => {
-                                &annotated_text_edit.text_edit
-                            }
-                        })
-                        .cloned()
-                        .collect();
-                    apply_edits(
-                        &document_edit.text_document.uri,
-                        document_edit.text_document.version,
-                        edits,
-                    )
-                    .map_err(|kind| ApplyEditError {
-                        kind,
-                        failed_change_idx: i,
-                    })?;
-                }
-            }
-            lsp::DocumentChanges::Operations(operations) => {
-                log::debug!("document changes - operations: {:?}", operations);
-                for (i, operation) in operations.iter().enumerate() {
-                    match operation {
-                        lsp::DocumentChangeOperation::Op(op) => {
-                            apply_document_resource_op(op).map_err(|io| ApplyEditError {
-                                kind: ApplyEditErrorKind::IoError(io),
-                                failed_change_idx: i,
-                            })?;
-                        }
-
-                        lsp::DocumentChangeOperation::Edit(document_edit) => {
-                            let edits = document_edit
-                                .edits
-                                .iter()
-                                .map(|edit| match edit {
-                                    lsp::OneOf::Left(text_edit) => text_edit,
-                                    lsp::OneOf::Right(annotated_text_edit) => {
-                                        &annotated_text_edit.text_edit
-                                    }
-                                })
-                                .cloned()
-                                .collect();
-                            apply_edits(
-                                &document_edit.text_document.uri,
-                                document_edit.text_document.version,
-                                edits,
-                            )
-                            .map_err(|kind| ApplyEditError {
-                                kind,
-                                failed_change_idx: i,
-                            })?;
-                        }
-                    }
-                }
-            }
-        }
-
-        return Ok(());
-    }
-
-    if let Some(ref changes) = workspace_edit.changes {
-        log::debug!("workspace changes: {:?}", changes);
-        for (i, (uri, text_edits)) in changes.iter().enumerate() {
-            let text_edits = text_edits.to_vec();
-            apply_edits(uri, None, text_edits).map_err(|kind| ApplyEditError {
-                kind,
-                failed_change_idx: i,
-            })?;
-        }
-    }
-
-    Ok(())
-}
-
+/// Precondition: `locations` should be non-empty.
 fn goto_impl(
     editor: &mut Editor,
     compositor: &mut Compositor,
@@ -1019,9 +820,7 @@ fn goto_impl(
         [location] => {
             jump_to_location(editor, location, offset_encoding, Action::Replace);
         }
-        [] => {
-            editor.set_error("No definition found.");
-        }
+        [] => unreachable!("`locations` should be non-empty for `goto_impl`"),
         _locations => {
             let picker = Picker::new(locations, cwdir, move |cx, location, action| {
                 jump_to_location(cx.editor, location, offset_encoding, action)
@@ -1063,7 +862,11 @@ where
         future,
         move |editor, compositor, response: Option<lsp::GotoDefinitionResponse>| {
             let items = to_locations(response);
-            goto_impl(editor, compositor, items, offset_encoding);
+            if items.is_empty() {
+                editor.set_error("No definition found.");
+            } else {
+                goto_impl(editor, compositor, items, offset_encoding);
+            }
         },
     );
 }
@@ -1123,7 +926,11 @@ pub fn goto_reference(cx: &mut Context) {
         future,
         move |editor, compositor, response: Option<Vec<lsp::Location>>| {
             let items = response.unwrap_or_default();
-            goto_impl(editor, compositor, items, offset_encoding);
+            if items.is_empty() {
+                editor.set_error("No references found.");
+            } else {
+                goto_impl(editor, compositor, items, offset_encoding);
+            }
         },
     );
 }
@@ -1256,7 +1063,7 @@ pub fn rename_symbol(cx: &mut Context) {
 
                 match block_on(future) {
                     Ok(edits) => {
-                        let _ = apply_workspace_edit(cx.editor, offset_encoding, &edits);
+                        let _ = cx.editor.apply_workspace_edit(offset_encoding, &edits);
                     }
                     Err(err) => cx.editor.set_error(err.to_string()),
                 }
